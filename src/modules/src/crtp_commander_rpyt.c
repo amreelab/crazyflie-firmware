@@ -34,8 +34,14 @@
 #include "FreeRTOS.h"
 #include "num.h"
 
+//Logging includes
+#include "log.h"
+
 #define MIN_THRUST  1000
 #define MAX_THRUST  60000
+
+uint16_t crtpThrust;
+uint16_t crtpThrustFinal;
 
 /**
  * CRTP commander rpyt packet format
@@ -130,6 +136,8 @@ void crtpCommanderRpytDecodeSetpoint(setpoint_t *setpoint, CRTPPacket *pk)
   // Thrust
   uint16_t rawThrust = values->thrust;
 
+  crtpThrust = values->thrust;
+
   if (thrustLocked || (rawThrust < MIN_THRUST)) {
     setpoint->thrust = 0;
   } else {
@@ -214,6 +222,8 @@ void crtpCommanderRpytDecodeSetpoint(setpoint_t *setpoint, CRTPPacket *pk)
       setpoint->attitude.yaw = values->yaw;
     }
   }
+
+  crtpThrustFinal = setpoint->thrust;
 }
 
 // Params for flight modes
@@ -227,3 +237,9 @@ PARAM_ADD(PARAM_UINT8, stabModeRoll, &stabilizationModeRoll)
 PARAM_ADD(PARAM_UINT8, stabModePitch, &stabilizationModePitch)
 PARAM_ADD(PARAM_UINT8, stabModeYaw, &stabilizationModeYaw)
 PARAM_GROUP_STOP(flightmode)
+
+
+LOG_GROUP_START(radioThrust)
+LOG_ADD(LOG_UINT16, thrustCRTP, &crtpThrust)
+LOG_ADD(LOG_UINT16, thrustFin, &crtpThrustFinal)
+LOG_GROUP_STOP(radioThrust)

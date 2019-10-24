@@ -59,6 +59,11 @@ static bool startPropTest = false;
 
 uint32_t inToOutLatency;
 
+float thrustCommander = 17;
+float thrustUpdate = 17;
+float thrustController = 17;
+float thrustPower = 17;
+
 // State variables for the stabilizer
 static setpoint_t setpoint;
 static sensorData_t sensorData;
@@ -271,11 +276,14 @@ static void stabilizerTask(void* param)
       compressState();
       
       commanderGetSetpoint(&setpoint, &state);
+      thrustCommander = setpoint.thrust;
       compressSetpoint();
 
       sitAwUpdateSetpoint(&setpoint, &sensorData, &state);
+      thrustUpdate = setpoint.thrust;
 
       controller(&control, &setpoint, &sensorData, &state, tick);
+      thrustController = control.thrust;
 
       checkEmergencyStopTimeout();
 
@@ -284,6 +292,7 @@ static void stabilizerTask(void* param)
       } else {
         powerDistribution(&control);
       }
+      thrustPower = control.thrust;
 
       // Log data to uSD card if configured
       if (   usddeckLoggingEnabled()
@@ -648,6 +657,13 @@ LOG_ADD(LOG_FLOAT, qy, &state.attitudeQuaternion.y)
 LOG_ADD(LOG_FLOAT, qz, &state.attitudeQuaternion.z)
 LOG_ADD(LOG_FLOAT, qw, &state.attitudeQuaternion.w)
 LOG_GROUP_STOP(stateEstimate)
+
+LOG_GROUP_START(thrust)
+LOG_ADD(LOG_INT16, comm, &thrustCommander)
+LOG_ADD(LOG_INT16, update, &thrustUpdate)
+LOG_ADD(LOG_INT16, control, &thrustController)
+LOG_ADD(LOG_INT16, power, &thrustPower)
+LOG_GROUP_STOP(thrust)
 
 LOG_GROUP_START(stateEstimateZ)
 LOG_ADD(LOG_INT16, x, &stateCompressed.x)                 // position - mm

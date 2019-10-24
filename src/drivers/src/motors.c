@@ -63,6 +63,8 @@ const uint16_t testsound[NBR_OF_MOTORS] = {A4, A5, F5, D5 };
 
 static bool isInit = false;
 
+uint16_t ithrustLog;
+
 /* Private functions */
 
 static uint16_t motorsBLConvBitsTo16(uint16_t bits)
@@ -226,6 +228,8 @@ void motorsSetRatio(uint32_t id, uint16_t ithrust)
 
     ratio = ithrust;
 
+    ithrustLog = ithrust;
+
   #ifdef ENABLE_THRUST_BAT_COMPENSATED
     if (motorMap[id]->drvType == BRUSHED)
     {
@@ -325,4 +329,5 @@ LOG_ADD(LOG_UINT32, m1_pwm, &motor_ratios[0])
 LOG_ADD(LOG_UINT32, m2_pwm, &motor_ratios[1])
 LOG_ADD(LOG_UINT32, m3_pwm, &motor_ratios[2])
 LOG_ADD(LOG_UINT32, m4_pwm, &motor_ratios[3])
+LOG_ADD(LOG_UINT16, thrust, &ithrustLog)
 LOG_GROUP_STOP(pwm)
