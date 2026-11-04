@@ -1,6 +1,6 @@
 /**
- *    ||          ____  _ __                           
- * +------+      / __ )(_) /_______________ _____  ___ 
+ *    ||          ____  _ __
+ * +------+      / __ )(_) /_______________ _____  ___
  * | 0xBC |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
  * +------+    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
  *  ||  ||    /_____/_/\__/\___/_/   \__,_/ /___/\___/
@@ -21,7 +21,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  *
- * ow.c - One-wire functions
+ * ow_syslink.c - One-wire functions
  */
 #define DEBUG_MODULE "OW"
 
@@ -36,89 +36,24 @@
 
 static xSemaphoreHandle waitForReply;
 static xSemaphoreHandle lockCmdBuf;
+static StaticSemaphore_t lockCmdBufBuffer;
 static OwCommand owCmdBuf;
 static bool owDataIsValid;
 
 static bool owSyslinkTransfer(uint8_t type, uint8_t length);
 
-#ifdef OW_WRITE_TEST
-static uint8_t bqtestData[] =
-{
-  0xEB, 0x00, 0x00, 0x00, 0x00, 0xBC, 0xFE, 0x3C, 0x00, 0x0D, 0x01, 0x08,
-  0x62, 0x63, 0x42, 0x51, 0x74, 0x65, 0x73, 0x74, 0x02, 0x01, 0x61, 0x70
-};
-#endif
-
-
 void owInit()
 {
   syslinkInit();
   vSemaphoreCreateBinary(waitForReply);
-  lockCmdBuf = xSemaphoreCreateMutex();
+  lockCmdBuf = xSemaphoreCreateMutexStatic(&lockCmdBufBuffer);
 
   // Put reply semaphore in right state.
   xSemaphoreTake(waitForReply, portMAX_DELAY);
+
 }
 
-bool owTest()
-{
-  uint8_t nOwMem = 0;
-  uint8_t nOwIter = 0;
-  OwSerialNum sn;
-
-  if (owScan(&nOwMem))
-  {
-    DEBUG_PRINT("Found %d.\n", nOwMem);
-  }
-  else
-  {
-    DEBUG_PRINT("Scan [FAILED].\n");
-  }
-
-  for (nOwIter = 0; nOwIter < nOwMem; nOwIter++)
-  {
-    if (owGetinfo(nOwIter, &sn))
-    {
-      DEBUG_PRINT("Serial 0x%X %X %X %X %X %X %X %X.\n",
-                  sn.type, sn.id[0], sn.id[1], sn.id[2],
-                  sn.id[3], sn.id[4], sn.id[5], sn.crc);
-    }
-    else
-    {
-      DEBUG_PRINT("Mem:%d Getinfo [FAILED].\n", nOwIter);
-    }
-  }
-
-#ifdef OW_READ_TEST
-  {
-    static uint8_t testbuf[129];
-
-    if (owRead(0, 0, OW_MAX_SIZE, testbuf))
-    {
-      for (nOwIter = 0; nOwIter < OW_MAX_SIZE; nOwIter++)
-      {
-        consolePrintf("%X ", testbuf[nOwIter]);
-        testbuf[nOwIter] = nOwIter;
-      }
-      consolePrintf("\n");
-    }
-  }
-#endif
-#ifdef OW_WRITE_TEST
-  if (owWrite(0, 0, sizeof(bqtestData), bqtestData))
-  {
-    DEBUG_PRINT("Write [OK].\n");
-  }
-  else
-  {
-    DEBUG_PRINT("Write [FAIL].\n");
-  }
-#endif
-
-  return true;
-}
-
-void owSyslinkRecieve(SyslinkPacket *slp)
+void owSyslinkReceive(SyslinkPacket *slp)
 {
   switch (slp->type)
   {
@@ -265,7 +200,7 @@ bool owRead(uint8_t selectMem, uint16_t address, uint8_t length, uint8_t *data)
   return status;
 }
 
-bool owWrite(uint8_t selectMem, uint16_t address, uint8_t length, uint8_t *data)
+bool owWrite(uint8_t selectMem, uint16_t address, uint8_t length, const uint8_t *data)
 {
   bool status = true;
   uint16_t currAddr = address;
@@ -317,4 +252,3 @@ bool owWrite(uint8_t selectMem, uint16_t address, uint8_t length, uint8_t *data)
 
   return status;
 }
-

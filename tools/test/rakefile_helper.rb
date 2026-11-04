@@ -1,8 +1,9 @@
-require 'yaml'
 require 'fileutils'
+require 'stringio'
 require './vendor/unity/auto/unity_test_summary'
 require './vendor/unity/auto/generate_test_runner'
 require './vendor/unity/auto/colour_reporter'
+require './vendor/unity/auto/yaml_helper'
 
 module RakefileHelpers
 
@@ -10,7 +11,7 @@ module RakefileHelpers
 
   def load_configuration(config_file)
     $cfg_file = config_file
-    $cfg = YAML.load(File.read($cfg_file))
+    $cfg  = YamlHelper.load_file($cfg_file)
     $colour_output = false unless $cfg['colour']
   end
 
@@ -66,7 +67,7 @@ module RakefileHelpers
   def find_file(name, paths)
     paths.each do |dir|
       src_file = dir + name
-      if (File.exists?(src_file))
+      if (File.exist?(src_file))
         return src_file
       end
     end
@@ -92,21 +93,21 @@ module RakefileHelpers
     return result
   end
 
-  def build_compiler_fields
+  def build_compiler_fields(extra_options=[])
     command  = tackit($cfg['compiler']['path'])
     if $cfg['compiler']['defines']['items'].nil?
       defines  = ''
     else
       defines  = squash($cfg['compiler']['defines']['prefix'], $cfg['compiler']['defines']['items'])
     end
-    options  = squash('', $cfg['compiler']['options'])
+    options  = squash('', $cfg['compiler']['options'] + extra_options)
     includes = squash($cfg['compiler']['includes']['prefix'], $cfg['compiler']['includes']['items'])
     includes = includes.gsub(/\\ /, ' ').gsub(/\\\"/, '"').gsub(/\\$/, '') # Remove trailing slashes (for IAR)
     return {:command => command, :defines => defines, :options => options, :includes => includes}
   end
 
-  def compile(file, defines=[])
-    compiler = build_compiler_fields
+  def compile(file, defines=[], extra_options=[])
+    compiler = build_compiler_fields(extra_options)
     cmd_str  = "#{compiler[:command]}#{compiler[:defines]}#{compiler[:options]}#{compiler[:includes]} #{file} " +
                "#{$cfg['compiler']['object_files']['prefix']}#{$cfg['compiler']['object_files']['destination']}"
     obj_file = "#{File.basename(file, C_EXTENSION)}#{$cfg['compiler']['object_files']['extension']}"
@@ -160,10 +161,18 @@ module RakefileHelpers
     return {:command => command, :pre_support => pre_support, :post_support => post_support}
   end
 
-  def execute(command_string, verbose=true)
-    report command_string
-    output = `#{command_string}`.chomp
-    report(output) if (verbose && !output.nil? && (output.length > 0))
+  def execute(command_string, logOutput: true)
+    if @test_task_log
+      @test_task_log.puts(command_string)
+    else
+      report(command_string) if $logCmd
+    end
+    output = `#{command_string} 2>&1`.chomp
+    if @test_task_log
+      @test_task_log.puts(output) if logOutput && !output.empty?
+    else
+      report(output) if logOutput && !output.empty?
+    end
     if $?.exitstatus != 0
       raise "Command failed. (Returned #{$?.exitstatus})"
     end
@@ -183,20 +192,21 @@ module RakefileHelpers
 
   def parse_and_run_tests(args)
     defines = find_defines_in_args(args)
+    defines += find_defines_in_kconfig($cfg['kconfig']['config_file'])
     test_files = find_test_files_in_args(args)
+    output_style = find_output_style_in_args(args)
+
+    set_environment_vars($cfg['env'])
 
     # No file names found in the args, find all files that are unit test files
     if test_files.length == 0
       test_files = exclude_test_files(get_unit_test_files(), defines)
     end
 
-    run_tests(test_files, defines)
+    run_tests(test_files, defines, output_style)
   end
 
-  def run_tests(test_files, defines)
-
-    report 'Running system tests...'
-
+  def run_tests(test_files, defines, output_style)
     # Tack on TEST define for compiling unit tests
     load_configuration($cfg_file)
     test_defines = ['TEST']
@@ -204,73 +214,127 @@ module RakefileHelpers
     $cfg['compiler']['defines']['items'] << 'TEST'
     $cfg['compiler']['defines']['items'].concat defines
 
+    $logCmd = false
+
     include_dirs = get_local_include_dirs
 
     # Build and execute each unit test
-    test_files.each do |test|
-      obj_list = []
+    terminal = $stdout
+    passed_tests = 0
+    failed_files = []
+    test_files.each_with_index do |test, index|
+      progress = "[#{index + 1}/#{test_files.length}] #{terminal.tty? ? File.basename(test) : test}"
+      terminal.print("\r\e[2K#{progress} ...") if terminal.tty?
+      terminal.flush
+      @test_task_log = StringIO.new
+      $stdout = @test_task_log
+      failure = nil
+      begin
+        obj_list = []
 
-      # Detect dependencies and build required modules
-      header_list = extract_headers(test) + ['cmock.h']
+        # Detect dependencies and build required modules
+        header_list = extract_headers(test) + ['cmock.h']
 
-      header_list.each do |header|
+        header_list.each do |header|
 
-        #create mocks if needed
-        if (header =~ /mock_/)
-          include_name = header.gsub('mock_','')
-          header_file = find_file(include_name, include_dirs)
+          #create mocks if needed
+          if (header =~ /mock_/)
+            include_name = header.gsub('mock_','')
+            header_file = find_file(include_name, include_dirs)
 
-          require "./vendor/cmock/lib/cmock.rb"
-          @cmock ||= CMock.new($cfg_file)
-          @cmock.setup_mocks([header_file])
+            require "./vendor/cmock/lib/cmock.rb"
+            @cmock ||= CMock.new($cfg_file)
+            @cmock.setup_mocks([header_file])
+          end
+
         end
 
-      end
-
-      #compile all mocks
-      header_list.each do |header|
-        #compile source file header if it exists
-        src_file = find_source_file(header, include_dirs)
-        if !src_file.nil?
-          obj_list << compile(src_file, test_defines)
+        #compile all mocks
+        header_list.each do |header|
+          #compile source file header if it exists
+          src_file = find_source_file(header, include_dirs)
+          if !src_file.nil?
+            obj_list << compile(src_file, test_defines)
+          end
         end
+
+        # build libs
+        obj_list += add_lib_source_files(['TEST_SUPPORT'], test_defines)
+        lib_annotations = read_lib_annotations(test)
+        obj_list += add_lib_source_files(lib_annotations, test_defines)
+
+        # Build the test runner (generate if configured to do so)
+        test_base = File.basename(test, C_EXTENSION)
+        runner_name = test_base + '_Runner.c'
+        if $cfg['compiler']['runner_path'].nil?
+          runner_path = $cfg['compiler']['build_path'] + runner_name
+          test_gen = UnityTestRunnerGenerator.new($cfg_file)
+          test_gen.run(test, runner_path)
+        else
+          runner_path = $cfg['compiler']['runner_path'] + runner_name
+        end
+
+        obj_list << compile(runner_path, test_defines)
+
+        # Build the test module
+        obj_list << compile(test, test_defines)
+
+        # Link the test executable
+        link_it(test_base, obj_list)
+
+        # Execute unit test and generate results file
+        simulator = build_simulator_fields
+        executable = $cfg['linker']['bin_files']['destination'] + test_base + $cfg['linker']['bin_files']['extension']
+        if simulator.nil?
+          cmd_str = executable
+        else
+          cmd_str = "#{simulator[:command]} #{simulator[:pre_support]} #{executable} #{simulator[:post_support]}"
+        end
+        output = execute(cmd_str)
+        test_results = $cfg['compiler']['build_path'] + test_base
+        if output.match(/OK$/m).nil?
+          test_results += '.testfail'
+        else
+          test_results += '.testpass'
+        end
+        File.open(test_results, 'w') { |f| f.print output }
+        raise "Test executable did not report OK" unless output.match(/OK$/m)
+
+        counts = output.match(/(\d+) Tests (\d+) Failures (\d+) Ignored/)
+        passed_tests += counts[1].to_i if counts
+        $stdout = terminal
+        terminal.print("\r\e[2K") if terminal.tty?
+        terminal.puts(@test_task_log.string) if output_style.include?('verbose')
+        test_count = counts ? " (#{counts[1]} #{counts[1] == '1' ? 'test' : 'tests'})" : ''
+        if terminal.tty? && !output_style.include?('verbose')
+          terminal.print("#{progress}: PASS#{test_count}")
+          terminal.flush
+        else
+          terminal.puts("#{progress}: PASS#{test_count}")
+        end
+      rescue StandardError => error
+        failure = error
+        failed_files << test
+      ensure
+        $stdout = terminal
+        if failure
+          terminal.print("\r\e[2K") if terminal.tty?
+          terminal.puts("#{progress}: FAIL")
+          terminal.print(@test_task_log.string)
+          terminal.puts unless @test_task_log.string.end_with?("\n")
+          terminal.puts("#{failure.class}: #{failure.message}")
+          terminal.puts(failure.backtrace.join("\n")) if failure.backtrace
+        end
+        @test_task_log = nil
       end
-
-      # Build the test runner (generate if configured to do so)
-      test_base = File.basename(test, C_EXTENSION)
-      runner_name = test_base + '_Runner.c'
-      if $cfg['compiler']['runner_path'].nil?
-        runner_path = $cfg['compiler']['build_path'] + runner_name
-        test_gen = UnityTestRunnerGenerator.new($cfg_file)
-        test_gen.run(test, runner_path)
-      else
-        runner_path = $cfg['compiler']['runner_path'] + runner_name
-      end
-
-      obj_list << compile(runner_path, test_defines)
-
-      # Build the test module
-      obj_list << compile(test, test_defines)
-
-      # Link the test executable
-      link_it(test_base, obj_list)
-
-      # Execute unit test and generate results file
-      simulator = build_simulator_fields
-      executable = $cfg['linker']['bin_files']['destination'] + test_base + $cfg['linker']['bin_files']['extension']
-      if simulator.nil?
-        cmd_str = executable
-      else
-        cmd_str = "#{simulator[:command]} #{simulator[:pre_support]} #{executable} #{simulator[:post_support]}"
-      end
-      output = execute(cmd_str)
-      test_results = $cfg['compiler']['build_path'] + test_base
-      if output.match(/OK$/m).nil?
-        test_results += '.testfail'
-      else
-        test_results += '.testpass'
-      end
-      File.open(test_results, 'w') { |f| f.print output }
+    end
+    terminal.print("\r\e[2K") if terminal.tty? && !output_style.include?('verbose')
+    if failed_files.empty?
+      terminal.puts("Passed: #{passed_tests} #{passed_tests == 1 ? 'test' : 'tests'} in #{test_files.length} test #{test_files.length == 1 ? 'file' : 'files'}")
+    else
+      terminal.puts("Failed: #{failed_files.length} of #{test_files.length} test files")
+      terminal.flush
+      raise "Failed test files: #{failed_files.join(', ')}"
     end
   end
 
@@ -308,6 +372,15 @@ module RakefileHelpers
     end
   end
 
+  def find_output_style_in_args(args)
+    key = 'UNIT_TEST_STYLE='
+    args.each do |arg|
+      if arg.start_with?(key)
+        return arg[(key.length)..-1].split(' ')
+      end
+    end
+  end
+
   # Parse the arguments and find all defines that are passed in on the command line
   # Defines are part of compiler flags and start with -D, for instance -DMY_DEFINE
   # All compiler flags are passed in as one string
@@ -324,19 +397,29 @@ module RakefileHelpers
     arg.split(' ').select {|part| part.start_with?('-D')}.map {|flag| flag[2..-1]}
   end
 
+  # Parse the config file generated by kconfig and find all defines
+  def find_defines_in_kconfig(config_file)
+    File.readlines(config_file).each.map{|l| l.strip}.select {|l| !l.start_with?('#') && !l.empty?}
+  end
+
   def exclude_test_files(files, defines)
+    # Extract the names of the defines and remove the values
+    trimmed_defines = defines.map {|define| define.split('=')[0]}
+
     files.select do |file|
-      !annotation_ignore_file?(file, defines)
+      !annotation_ignore_file?(file, trimmed_defines)
     end
   end
 
 
   # WARNING This implementation is fairly brittle. Basically only intended for cases such as
   # // @IGNORE_IF_NOT PLATFORM_CF2
-  # Ignores values of defines, so this would fail and keep the file
+  # or
+  # // @IGNORE_IF_NOT CONFIG_DECK_LIGHTHOUSE
+  # Ignores values of defines, so this would remove the file
   # param to gradle: -DMYDEFINE=0
   # // @IGNORE_IF_NOT MYDEFINE
-  def annotation_ignore_file?(file, defines)
+  def annotation_ignore_file?(file, trimmed_defines)
     ignore_str = '@IGNORE_IF_NOT'
 
     File.foreach( file ) do |line|
@@ -346,7 +429,7 @@ module RakefileHelpers
 
         if tokens.length >= (index + 2)
           condition = tokens[index + 1]
-          conditionIsMet = defines.detect {|define| define == condition}
+          conditionIsMet = trimmed_defines.include? condition
           if !conditionIsMet
             return true
           end
@@ -355,5 +438,50 @@ module RakefileHelpers
     end
 
     return false
+  end
+
+  # Annotation to add files for libraries
+  # When this annotation is used source files for libs are added to the build
+  # with the unit test so that they can be called and does not have to be
+  # replaced by mocks.
+  def read_lib_annotations(file)
+    annotation_str = '@BUILD_LIB'
+    libs = []
+
+    File.foreach( file ) do |line|
+      if line.include? annotation_str
+        tokens = line.split(' ')
+        index = tokens.index annotation_str
+
+        if tokens.length >= (index + 2)
+          libs << tokens[index + 1]
+        end
+      end
+    end
+
+    libs
+  end
+
+  def add_lib_source_files(libs, test_defines)
+    obj_list = []
+    libs.each do |lib|
+      puts 'Adding lib ' + lib
+
+      files = $cfg['compiler']['libs'][lib]['files'] || []
+      extra_options = $cfg['compiler']['libs'][lib]['extra_options'] || []
+
+      files.each do |src_file|
+        obj_list << compile(src_file, test_defines, extra_options=extra_options)
+      end
+    end
+
+    obj_list
+  end
+
+  def set_environment_vars(env_vars)
+    # puts "Setting env vars: " + env_vars.to_s
+    env_vars.each do |key, val|
+      ENV[key] = val
+    end
   end
 end

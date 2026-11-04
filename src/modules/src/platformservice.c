@@ -7,7 +7,7 @@
  *
  * Crazyflie control firmware
  *
- * Copyright (C) 2011-2012 Bitcraze AB
+ * Copyright (C) 2011-2021 Bitcraze AB
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,15 +21,16 @@
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  *
- * crtpservice.c - Implements low level services for CRTP
+ * platformservice.c - Implements platform services for CRTP
  */
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 
 /* FreeRtos includes */
 #include "FreeRTOS.h"
-#include <stdint.h>
-#include <string.h>
+#include "task.h"
 
 #include "config.h"
 #include "crtp.h"
@@ -37,16 +38,29 @@
 #include "syslink.h"
 #include "version.h"
 #include "platform.h"
+#include "app_channel.h"
+#include "static_mem.h"
+#include "ledseq.h"
+#include "worker.h"
+#include "supervisor.h"
+
+#define DEBUG_MODULE "PLAT"
+#include "debug.h"
 
 static bool isInit=false;
+STATIC_MEM_TASK_ALLOC_STACK_NO_DMA_CCM_SAFE(platformSrvTask, PLATFORM_SRV_TASK_STACKSIZE);
 
 typedef enum {
   platformCommand   = 0x00,
   versionCommand    = 0x01,
+  appChannel        = 0x02,
 } Channel;
 
 typedef enum {
-  setContinousWave   = 0x00,
+  setContinuousWave    = 0x00,
+  armSystem            = 0x01, // Deprecated: moved to crtp_supervisor
+  recoverSystem        = 0x02, // Deprecated: moved to crtp_supervisor
+  userNotification     = 0x03,
 } PlatformCommand;
 
 typedef enum {
@@ -55,17 +69,20 @@ typedef enum {
   getDeviceTypeName  = 0x02,
 } VersionCommand;
 
-void platformserviceHandler(CRTPPacket *p);
-static void platformCommandProcess(uint8_t command, uint8_t *data);
+static void platformSrvTask(void*);
+static void platformCommandProcess(CRTPPacket *p);
 static void versionCommandProcess(CRTPPacket *p);
+static void runUserNotification(void* arg);
 
 void platformserviceInit(void)
 {
   if (isInit)
     return;
 
-  // Register a callback to service the Platform port
-  crtpRegisterPortCB(CRTP_PORT_PLATFORM, platformserviceHandler);
+  appchannelInit();
+
+  //Start the task
+  STATIC_MEM_TASK_CREATE(platformSrvTask, platformSrvTask, PLATFORM_SRV_TASK_NAME, NULL, PLATFORM_SRV_TASK_PRI);
 
   isInit = true;
 }
@@ -75,59 +92,136 @@ bool platformserviceTest(void)
   return isInit;
 }
 
-void platformserviceHandler(CRTPPacket *p)
+static void platformSrvTask(void* prm)
 {
-  switch (p->channel)
-  {
-    case platformCommand:
-      platformCommandProcess(p->data[0], &p->data[1]);
-      crtpSendPacket(p);
-      break;
-    case versionCommand:
-      versionCommandProcess(p);
-    default:
-      break;
+  static CRTPPacket p;
+
+  crtpInitTaskQueue(CRTP_PORT_PLATFORM);
+
+  while(1) {
+    crtpReceivePacketBlock(CRTP_PORT_PLATFORM, &p);
+
+    switch (p.channel)
+    {
+      case platformCommand:
+        platformCommandProcess(&p);
+        crtpSendPacketBlock(&p);
+        break;
+      case versionCommand:
+        versionCommandProcess(&p);
+        break;
+      case appChannel:
+        appchannelIncomingPacket(&p);
+        break;
+      default:
+        break;
+    }
   }
 }
 
-static void platformCommandProcess(uint8_t command, uint8_t *data)
+static void platformCommandProcess(CRTPPacket *p)
 {
-  SyslinkPacket slp;
+  uint8_t command = p->data[0];
+  uint8_t *data = &p->data[1];
 
   switch (command) {
-    case setContinousWave:
+    case setContinuousWave:
+    {
+      static SyslinkPacket slp;
       slp.type = SYSLINK_RADIO_CONTWAVE;
       slp.length = 1;
       slp.data[0] = data[0];
       syslinkSendPacket(&slp);
       break;
+    }
+    case armSystem:
+    {
+      // Deprecated: use CRTP_PORT_SUPERVISOR instead
+      DEBUG_PRINT("WARNING: arming via platform port is deprecated, use supervisor port\n");
+      if (p->size < 2) {
+        data[0] = false;
+        data[1] = supervisorIsArmed();
+        p->size = 3;
+        break;
+      }
+      const bool doArm = data[0];
+      const bool success = supervisorRequestArming(doArm);
+      data[0] = success;
+      data[1] = supervisorIsArmed();
+      p->size = 3;
+      break;
+    }
+    case recoverSystem:
+    {
+      // Deprecated: use CRTP_PORT_SUPERVISOR instead
+      DEBUG_PRINT("WARNING: recovery via platform port is deprecated, use supervisor port\n");
+      const bool success = supervisorRequestCrashRecovery(true);
+      data[0] = success;
+      data[1] = !supervisorIsCrashed();
+      p->size = 3;
+      break;
+    }
+    case userNotification:
+    {
+      // 0 - fail
+      // 1 - success
+      const uint8_t notificationType = data[0];
+
+      workerSchedule(runUserNotification, (void*)(uint32_t)notificationType);
+      p->size = 0;
+      break;
+    }
     default:
       break;
   }
+}
+
+int platformserviceSendAppchannelPacket(CRTPPacket *p)
+{
+  p->port = CRTP_PORT_PLATFORM;
+  p->channel = appChannel;
+  return crtpSendPacket(p);
+}
+
+int platformserviceSendAppchannelPacketBlock(CRTPPacket *p)
+{
+  p->port = CRTP_PORT_PLATFORM;
+  p->channel = appChannel;
+  return crtpSendPacketBlock(p);
 }
 
 static void versionCommandProcess(CRTPPacket *p)
 {
   switch (p->data[0]) {
     case getProtocolVersion:
-      *(int*)&p->data[1] = PROTOCOL_VERSION;
+      *(int*)&p->data[1] = CRTP_PROTOCOL_VERSION;
       p->size = 5;
-      crtpSendPacket(p);
+      crtpSendPacketBlock(p);
       break;
     case getFirmwareVersion:
       strncpy((char*)&p->data[1], V_STAG, CRTP_MAX_DATA_SIZE-1);
       p->size = (strlen(V_STAG)>CRTP_MAX_DATA_SIZE-1)?CRTP_MAX_DATA_SIZE:strlen(V_STAG)+1;
-      crtpSendPacket(p);
+      crtpSendPacketBlock(p);
       break;
     case getDeviceTypeName:
       {
       const char* name = platformConfigGetDeviceTypeName();
       strncpy((char*)&p->data[1], name, CRTP_MAX_DATA_SIZE-1);
       p->size = (strlen(name)>CRTP_MAX_DATA_SIZE-1)?CRTP_MAX_DATA_SIZE:strlen(name)+1;
-      crtpSendPacket(p);
+      crtpSendPacketBlock(p);
       }
       break;
     default:
       break;
+  }
+}
+
+static void runUserNotification(void* arg)
+{
+  uint8_t notificationType = (uint32_t)arg;
+  if (notificationType) {
+    ledseqRun(&seq_user_notification_success);
+  } else {
+    ledseqRun(&seq_user_notification_fail);
   }
 }

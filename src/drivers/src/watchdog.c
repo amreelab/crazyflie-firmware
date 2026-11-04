@@ -21,15 +21,13 @@
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  *
- * @file watchdog.c - Implementaion of hardware watchdog
+ * @file watchdog.c - Implementation of hardware watchdog
  *
  */
 #define DEBUG_MODULE "SYS"
 
 #include "debug.h"
-
 #include "watchdog.h"
-#include "cfassert.h"
 
 
 bool watchdogNormalStartTest(void)
@@ -40,7 +38,6 @@ bool watchdogNormalStartTest(void)
 		RCC_ClearFlag();
 		wasNormalStart = false;
 		DEBUG_PRINT("The system resumed after watchdog timeout [WARNING]\n");
-		printAssertSnapshotData();
 	}
 
 	return wasNormalStart;

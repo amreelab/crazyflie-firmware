@@ -63,7 +63,7 @@ int consolePutcharFromISR(int ch);
  * @param str Null terminated string
  * @return a nonnegative number on success, or EOF on error.
  */
-int consolePuts(char *str);
+int consolePuts(const char *str);
 
 /**
  * Flush the console buffer
@@ -74,7 +74,7 @@ void consoleFlush(void);
  * Macro implementing consolePrintf with eprintf
  *
  * @param FMT String format
- * @patam ... Parameters to print
+ * @param ... Parameters to print
  */
 #define consolePrintf(FMT, ...) eprintf(consolePutchar, FMT, ## __VA_ARGS__)
 

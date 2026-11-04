@@ -1,6 +1,6 @@
 /*
- *    ||          ____  _ __                           
- * +------+      / __ )(_) /_______________ _____  ___ 
+ *    ||          ____  _ __
+ * +------+      / __ )(_) /_______________ _____  ___
  * | 0xBC |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
  * +------+    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
  *  ||  ||    /_____/_/\__/\___/_/   \__,_/ /___/\___/
@@ -42,15 +42,20 @@
 #include "led.h"
 #include "ledseq.h"
 #include "queuemonitor.h"
+#include "static_mem.h"
+#include "cfassert.h"
 
 #define RADIOLINK_TX_QUEUE_SIZE (1)
-#define RADIOLINK_CTRP_QUEUE_SIZE (5)
-#define RADIO_ACTIVITY_TIMEOUT_MS (1000)
+#define RADIOLINK_CRTP_QUEUE_SIZE (5)
+#define RADIO_ACTIVITY_TIMEOUT_MS CONFIG_RADIO_ACTIVITY_TIMEOUT_MS
 
 #define RADIOLINK_P2P_QUEUE_SIZE (5)
 
 static xQueueHandle  txQueue;
+STATIC_MEM_QUEUE_ALLOC(txQueue, RADIOLINK_TX_QUEUE_SIZE, sizeof(SyslinkPacket));
+
 static xQueueHandle crtpPacketDelivery;
+STATIC_MEM_QUEUE_ALLOC(crtpPacketDelivery, RADIOLINK_CRTP_QUEUE_SIZE, sizeof(CRTPPacket));
 
 static bool isInit;
 
@@ -62,6 +67,8 @@ static int radiolinkReceiveCRTPPacket(CRTPPacket *p);
 static uint8_t rssi;
 static bool isConnected;
 static uint32_t lastPacketTick;
+static uint16_t count_rx_broadcast;
+static uint16_t count_rx_unicast;
 
 static volatile P2PCallback p2p_callback;
 
@@ -82,9 +89,9 @@ void radiolinkInit(void)
   if (isInit)
     return;
 
-  txQueue = xQueueCreate(RADIOLINK_TX_QUEUE_SIZE, sizeof(SyslinkPacket));
+  txQueue = STATIC_MEM_QUEUE_CREATE(txQueue);
   DEBUG_QUEUE_MONITOR_REGISTER(txQueue);
-  crtpPacketDelivery = xQueueCreate(RADIOLINK_CTRP_QUEUE_SIZE, sizeof(CRTPPacket));
+  crtpPacketDelivery = STATIC_MEM_QUEUE_CREATE(crtpPacketDelivery);
   DEBUG_QUEUE_MONITOR_REGISTER(crtpPacketDelivery);
 
   ASSERT(crtpPacketDelivery);
@@ -152,22 +159,38 @@ void radiolinkSyslinkDispatch(SyslinkPacket *slp)
     lastPacketTick = xTaskGetTickCount();
   }
 
-  if (slp->type == SYSLINK_RADIO_RAW)
+  if (slp->type == SYSLINK_RADIO_READY)
+  {
+    // ACK from nRF51 confirming radio is now enabled
+    // No action needed, just silently acknowledge
+  }
+  else if (slp->type == SYSLINK_RADIO_RAW)
   {
     slp->length--; // Decrease to get CRTP size.
+#ifdef CONFIG_RADIO_ASSERT_ON_QUEUE_FULL
+    // Assert that we are not dropping any packets
+    ASSERT(xQueueSend(crtpPacketDelivery, &slp->length, 0) == pdPASS);
+#else
     xQueueSend(crtpPacketDelivery, &slp->length, 0);
-    ledseqRun(LINK_LED, seq_linkup);
+#endif
+    ++count_rx_unicast;
+    ledseqRun(&seq_linkUp);
     // If a radio packet is received, one can be sent
     if (xQueueReceive(txQueue, &txPacket, 0) == pdTRUE)
     {
-      ledseqRun(LINK_DOWN_LED, seq_linkup);
+      ledseqRun(&seq_linkDown);
       syslinkSendPacket(&txPacket);
     }
   } else if (slp->type == SYSLINK_RADIO_RAW_BROADCAST)
   {
     slp->length--; // Decrease to get CRTP size.
-    xQueueSend(crtpPacketDelivery, &slp->length, 0);
-    ledseqRun(LINK_LED, seq_linkup);
+    // broadcasts are best effort, so no need to handle the case where the queue is full
+    BaseType_t result = xQueueSend(crtpPacketDelivery, &slp->length, 0);
+    // only increment the received counter, if we were able to put it in the queue
+    if (result == pdPASS) {
+      ++count_rx_broadcast;
+    }
+    ledseqRun(&seq_linkUp);
     // no ack for broadcasts
   } else if (slp->type == SYSLINK_RADIO_RSSI)
   {
@@ -175,14 +198,18 @@ void radiolinkSyslinkDispatch(SyslinkPacket *slp)
     memcpy(&rssi, slp->data, sizeof(uint8_t)); //rssi will not change on disconnect
   } else if (slp->type == SYSLINK_RADIO_P2P_BROADCAST)
   {
-    ledseqRun(LINK_LED, seq_linkup);
+    ledseqRun(&seq_linkUp);
     P2PPacket p2pp;
     p2pp.port=slp->data[0];
     p2pp.rssi = slp->data[1];
-    memcpy(&p2pp.data[0], &slp->data[2],slp->length-2);
-    p2pp.size=slp->length;
-    if (p2p_callback)
+
+    const uint8_t p2pDataLength = slp->length - 2;
+    memcpy(&p2pp.data[0], &slp->data[2], p2pDataLength);
+    p2pp.size = p2pDataLength;
+
+    if (p2p_callback) {
         p2p_callback(&p2pp);
+    }
   }
 
   isConnected = radiolinkIsConnected();
@@ -190,7 +217,8 @@ void radiolinkSyslinkDispatch(SyslinkPacket *slp)
 
 static int radiolinkReceiveCRTPPacket(CRTPPacket *p)
 {
-  if (xQueueReceive(crtpPacketDelivery, p, M2T(100)) == pdTRUE)
+  if (crtpPacketDelivery != 0 &&
+      xQueueReceive(crtpPacketDelivery, p, M2T(100)) == pdTRUE)
   {
     return 0;
   }
@@ -213,7 +241,8 @@ static int radiolinkSendCRTPPacket(CRTPPacket *p)
   slp.length = p->size + 1;
   memcpy(slp.data, &p->header, p->size + 1);
 
-  if (xQueueSend(txQueue, &slp, M2T(100)) == pdTRUE)
+  if (txQueue != 0 &&
+      xQueueSend(txQueue, &slp, M2T(100)) == pdTRUE)
   {
     return true;
   }
@@ -232,7 +261,7 @@ bool radiolinkSendP2PPacketBroadcast(P2PPacket *p)
   memcpy(slp.data, p->raw, p->size + 1);
 
   syslinkSendPacket(&slp);
-  ledseqRun(LINK_DOWN_LED, seq_linkup);
+  ledseqRun(&seq_linkDown);
 
   return true;
 }
@@ -248,7 +277,28 @@ static int radiolinkSetEnable(bool enable)
   return 0;
 }
 
+/**
+ * Radio link log variables.
+ */
 LOG_GROUP_START(radio)
-LOG_ADD(LOG_UINT8, rssi, &rssi)
-LOG_ADD(LOG_UINT8, isConnected, &isConnected)
+/**
+ * @brief Radio Signal Strength Indicator [dBm]
+ */
+LOG_ADD_CORE(LOG_UINT8, rssi, &rssi)
+/**
+ * @brief Indicator if a packet was received from the radio within the last RADIO_ACTIVITY_TIMEOUT_MS.
+ */
+LOG_ADD_CORE(LOG_UINT8, isConnected, &isConnected)
+/**
+ * @brief Number of broadcast packets received.
+ * 
+ * Note that this is only 16 bits and overflows. Use overflow correction on the client side.
+ */
+LOG_ADD_CORE(LOG_UINT16, numRxBc, &count_rx_broadcast)
+/**
+ * @brief Number of unicast packets received.
+ * 
+ * Note that this is only 16 bits and overflows. Use overflow correction on the client side.
+ */
+LOG_ADD_CORE(LOG_UINT16, numRxUc, &count_rx_unicast)
 LOG_GROUP_STOP(radio)

@@ -27,7 +27,7 @@
  ******************************************************************************/
 
 /**
- * @file   vl53l1_platform.c
+ * @file   vl53l1x.c
  * @brief  Code function definitions for Crazyflie
  *
  */
@@ -48,8 +48,7 @@
 	#define VL53L1_get_register_name(a,b)
 #endif
 
-// Set the start address 8 step after the VL53L0 dynamic addresses
-static int nextI2CAddress = VL53L1X_DEFAULT_ADDRESS+8;
+static int nextI2CAddress = RANGER_DECKS_ADDRESS_START;
 
 
 bool vl53l1xInit(VL53L1_Dev_t *pdev, I2C_Dev *I2Cx)
@@ -57,8 +56,7 @@ bool vl53l1xInit(VL53L1_Dev_t *pdev, I2C_Dev *I2Cx)
   VL53L1_Error status = VL53L1_ERROR_NONE;
 
   pdev->I2Cx = I2Cx;
-  pdev->devAddr = VL53L1X_DEFAULT_ADDRESS;
-  i2cdevInit(pdev->I2Cx);
+  pdev->devAddr = RANGER_DECKS_DEFAULT_ADDRESS;
 
   /* Move initialized sensor to a new I2C address */
   int newAddress;
@@ -66,10 +64,17 @@ bool vl53l1xInit(VL53L1_Dev_t *pdev, I2C_Dev *I2Cx)
   taskENTER_CRITICAL();
   newAddress = nextI2CAddress++;
   taskEXIT_CRITICAL();
+  if(newAddress > RANGER_DECKS_ADDRESS_END)
+  {
+	status = VL53L1_ERROR_UNDEFINED;
+  }
 
-  vl53l1xSetI2CAddress(pdev, newAddress);
+  if (status == VL53L1_ERROR_NONE)
+  {
+  	vl53l1xSetI2CAddress(pdev, newAddress);
 
-  status = VL53L1_DataInit(pdev);
+	status = VL53L1_DataInit(pdev);
+  }
 
   if (status == VL53L1_ERROR_NONE)
   {
@@ -194,14 +199,16 @@ VL53L1_Error VL53L1_RdByte(
 	uint16_t      index,
 	uint8_t      *pdata)
 {
-	VL53L1_Error status         = VL53L1_ERROR_NONE;
+  VL53L1_Error status         = VL53L1_ERROR_NONE;
+  static uint8_t r8data;
 
-	if (!i2cdevRead16(pdev->I2Cx, pdev->devAddr, index, 1, pdata))
+  if (!i2cdevRead16(pdev->I2Cx, pdev->devAddr, index, 1, &r8data))
   {
     status = VL53L1_ERROR_CONTROL_INTERFACE;
   }
+  *pdata = r8data;
 
-	return status;
+  return status;
 }
 
 
@@ -210,14 +217,16 @@ VL53L1_Error VL53L1_RdWord(
 	uint16_t      index,
 	uint16_t     *pdata)
 {
-	VL53L1_Error status         = VL53L1_ERROR_NONE;
+  VL53L1_Error status         = VL53L1_ERROR_NONE;
+  static uint16_t r16data;
 
-  if (!i2cdevRead16(pdev->I2Cx, pdev->devAddr, index, 2, (uint8_t *)pdata))
+  if (!i2cdevRead16(pdev->I2Cx, pdev->devAddr, index, 2, (uint8_t *)&r16data))
   {
     status = VL53L1_ERROR_CONTROL_INTERFACE;
   }
-
-	return status;
+  *pdata = r16data;
+  
+  return status;
 }
 
 
@@ -226,14 +235,16 @@ VL53L1_Error VL53L1_RdDWord(
 	uint16_t      index,
 	uint32_t     *pdata)
 {
-	VL53L1_Error status = VL53L1_ERROR_NONE;
+  VL53L1_Error status = VL53L1_ERROR_NONE;
+  static uint32_t r32data;
 
-	if (!i2cdevRead16(pdev->I2Cx, pdev->devAddr, index, 4, (uint8_t *)pdata))
+  if (!i2cdevRead16(pdev->I2Cx, pdev->devAddr, index, 4, (uint8_t *)&r32data))
   {
     status = VL53L1_ERROR_CONTROL_INTERFACE;
   }
+  *pdata = r32data;
 
-	return status;
+  return status;
 }
 
 /*

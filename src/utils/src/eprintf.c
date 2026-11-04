@@ -18,10 +18,12 @@
  * The float handling is verry limited and without exponential notation (ie.
  * works good for number around 0 and within int32 value range).
  *
+ * \verbatim
  * To use this printf a 'putc' function shall be implemented with the prototype
  * 'int putc(int)'. Then a macro calling eprintf can be created. For example:
  * int consolePutc(int c);
  * #define consolePrintf(FMT, ...) eprintf(consolePutc, FMT, ## __VA_ARGS__)
+ * \endverbatim
  */
 #include "eprintf.h"
 
@@ -29,6 +31,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <math.h>
 
 static const char digit[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 
                              'A', 'B', 'C', 'D', 'E', 'F'};
@@ -151,7 +154,7 @@ static int itoa16(putc_t putcf, uint64_t num, int width, char padChar)
   return len;
 }
 
-static int handleLongLong(putc_t putcf, char** fmt, unsigned long long int val, int width, char padChar)
+static int handleLongLong(putc_t putcf, const char** fmt, unsigned long long int val, int width, char padChar)
 {
   int len = 0;
 
@@ -176,7 +179,7 @@ static int handleLongLong(putc_t putcf, char** fmt, unsigned long long int val, 
   return len;
 }
 
-static int handleLong(putc_t putcf, char** fmt, unsigned long int val, int width, char padChar)
+static int handleLong(putc_t putcf, const char** fmt, unsigned long int val, int width, char padChar)
 {
   int len = 0;
 
@@ -201,7 +204,7 @@ static int handleLong(putc_t putcf, char** fmt, unsigned long int val, int width
   return len;
 }
 
-int evprintf(putc_t putcf, char * fmt, va_list ap)
+int evprintf(putc_t putcf, const char * fmt, va_list ap)
 {
   int len=0;
   float num;
@@ -219,6 +222,12 @@ int evprintf(putc_t putcf, char * fmt, va_list ap)
       width = 0;
 
       fmt++;
+      if (*fmt == '%') {
+        putcf(*fmt++);
+        len++;
+        continue;
+      }
+
       while ('0' == *fmt)
       {
         padChar = '0';
@@ -269,15 +278,21 @@ int evprintf(putc_t putcf, char * fmt, va_list ap)
           break;
         case 'f':
           num = va_arg(ap, double);
-          if(num<0)
-          {
-            putcf('-');
-            num = -num;
-            len++;
+          if (isnan(num)) {
+            putcf('n');len++;
+            putcf('a');len++;
+            putcf('n');len++;
+          } else {
+            if(num<0)
+            {
+              putcf('-');
+              num = -num;
+              len++;
+            }
+            len += itoa10(putcf, (int)num, 0);
+            putcf('.'); len++;
+            len += itoa10(putcf, (num - (int)num) * power(10,precision), precision);
           }
-          len += itoa10(putcf, (int)num, 0);
-          putcf('.'); len++;
-          len += itoa10(putcf, (num - (int)num) * power(10,precision), precision);
           break;
         case 's':
           str = va_arg(ap, char* );
@@ -305,7 +320,7 @@ int evprintf(putc_t putcf, char * fmt, va_list ap)
   return len;
 }
 
-int eprintf(putc_t putcf, char * fmt, ...)
+int eprintf(putc_t putcf, const char * fmt, ...)
 {
   va_list ap;
   int len;

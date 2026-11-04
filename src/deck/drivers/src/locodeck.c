@@ -7,7 +7,7 @@
  *
  * Crazyflie control firmware
  *
- * Copyright (C) 2016 Bitcraze AB
+ * Copyright (C) 2021 Bitcraze AB
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -41,6 +41,7 @@
 #include "task.h"
 #include "queue.h"
 
+#include "autoconf.h"
 #include "deck.h"
 #include "system.h"
 #include "debug.h"
@@ -48,6 +49,8 @@
 #include "param.h"
 #include "nvicconf.h"
 #include "estimator.h"
+#include "statsCnt.h"
+#include "mem.h"
 
 #include "locodeck.h"
 
@@ -59,29 +62,31 @@
 #define CS_PIN DECK_GPIO_IO1
 
 // LOCO deck alternative IRQ and RESET pins(IO_2, IO_3) instead of default (RX1, TX1), leaving UART1 free for use
-#ifdef LOCODECK_USE_ALT_PINS
-    #define GPIO_PIN_IRQ 	GPIO_Pin_5
-	#define GPIO_PIN_RESET 	GPIO_Pin_4
-	#define GPIO_PORT		GPIOB
-	#define EXTI_PortSource EXTI_PortSourceGPIOB
-	#define EXTI_PinSource 	EXTI_PinSource5
-	#define EXTI_LineN 		EXTI_Line5
-	#define EXTI_IRQChannel EXTI9_5_IRQn
+#ifdef CONFIG_DECK_LOCODECK_USE_ALT_PINS
+  #define GPIO_PIN_IRQ    DECK_GPIO_IO2
+
+  #ifndef CONFIG_LOCODECK_ALT_PIN_RESET
+  #define GPIO_PIN_RESET  DECK_GPIO_IO3
+  #else
+  #define GPIO_PIN_RESET  DECK_GPIO_IO4
+  #endif
+
+  #define EXTI_PortSource EXTI_PortSourceGPIOB
+  #define EXTI_PinSource  EXTI_PinSource5
+  #define EXTI_LineN      EXTI_Line5
 #else
-    #define GPIO_PIN_IRQ 	GPIO_Pin_11
-	#define GPIO_PIN_RESET 	GPIO_Pin_10
-	#define GPIO_PORT		GPIOC
-	#define EXTI_PortSource EXTI_PortSourceGPIOC
-	#define EXTI_PinSource 	EXTI_PinSource11
-	#define EXTI_LineN 		EXTI_Line11
-	#define EXTI_IRQChannel EXTI15_10_IRQn
+  #define GPIO_PIN_IRQ    DECK_GPIO_RX1
+  #define GPIO_PIN_RESET  DECK_GPIO_TX1
+  #define EXTI_PortSource EXTI_PortSourceGPIOC
+  #define EXTI_PinSource  EXTI_PinSource11
+  #define EXTI_LineN      EXTI_Line11
 #endif
 
 
 #define DEFAULT_RX_TIMEOUT 10000
 
-
-#define ANTENNA_OFFSET 154.6   // In meter
+// Time (ms) without received packets after which we probe the chip over SPI
+static const uint32_t locoHealthProbeMs = 2000;
 
 // The anchor position can be set using parameters
 // As an option you can set a static position in this file and set
@@ -89,11 +94,11 @@
 
 static lpsAlgoOptions_t algoOptions = {
   // .userRequestedMode is the wanted algorithm, available as a parameter
-#if LPS_TDOA_ENABLE
+#if defined(CONFIG_DECK_LOCO_ALGORITHM_TDOA2)
   .userRequestedMode = lpsMode_TDoA2,
-#elif LPS_TDOA3_ENABLE
+#elif defined(CONFIG_DECK_LOCO_ALGORITHM_TDOA3)
   .userRequestedMode = lpsMode_TDoA3,
-#elif defined(LPS_TWR_ENABLE)
+#elif defined(CONFIG_DECK_LOCO_ALGORITHM_TWR)
   .userRequestedMode = lpsMode_TWR,
 #else
   .userRequestedMode = lpsMode_auto,
@@ -115,23 +120,67 @@ struct {
   [lpsMode_TDoA3] = {.algorithm = &uwbTdoa3TagAlgorithm, .name="TDoA3"},
 };
 
-#if LPS_TDOA_ENABLE
+#if defined(CONFIG_DECK_LOCO_ALGORITHM_TDOA2)
 static uwbAlgorithm_t *algorithm = &uwbTdoa2TagAlgorithm;
-#elif LPS_TDOA3_ENABLE
+#elif defined(CONFIG_DECK_LOCO_ALGORITHM_TDOA3)
 static uwbAlgorithm_t *algorithm = &uwbTdoa3TagAlgorithm;
 #else
 static uwbAlgorithm_t *algorithm = &uwbTwrTagAlgorithm;
 #endif
 
 static bool isInit = false;
-static SemaphoreHandle_t irqSemaphore;
+
+uint8_t locoEnableEstimator = 1;
+
+static TaskHandle_t uwbTaskHandle = 0;
 static SemaphoreHandle_t algoSemaphore;
+
+// Liveness tracking for the positioning watchdog. chipResponding is written by
+// uwbTask() and read by locoDeckStatus() from the supervisor task.
+static volatile bool chipResponding = false;
+static uint32_t lastUwbActivityTick = 0;
+// CHAN_CTRL value captured at init. It survives mode switches but reverts to
+// default on a chip reset (e.g. power glitch), so a mismatch means the chip
+// has lost its configuration even though it still answers over SPI.
+static uint32_t expectedChanCtrl = 0;
+
+// Event counters for mode-switch diagnostics
+static uint32_t dbgRxCount = 0;
+static uint32_t dbgTimeoutCount = 0;
+static uint32_t dbgFailedCount = 0;
 static dwDevice_t dwm_device;
 static dwDevice_t *dwm = &dwm_device;
 
 static QueueHandle_t lppShortQueue;
 
 static uint32_t timeout;
+
+static STATS_CNT_RATE_DEFINE(spiWriteCount, 1000);
+static STATS_CNT_RATE_DEFINE(spiReadCount, 1000);
+
+// Memory read/write handling
+#define MEM_LOCO_INFO             0x0000
+#define MEM_LOCO_ANCHOR_BASE      0x1000
+#define MEM_LOCO_ANCHOR_PAGE_SIZE 0x0100
+#define MEM_LOCO_PAGE_LEN         (3 * sizeof(float) + 1)
+
+#define MEM_ANCHOR_ID_LIST_LENGTH 256
+
+#define MEM_LOCO2_ID_LIST          0x0000
+#define MEM_LOCO2_ACTIVE_LIST      0x1000
+#define MEM_LOCO2_ANCHOR_BASE      0x2000
+#define MEM_LOCO2_ANCHOR_PAGE_SIZE 0x0100
+#define MEM_LOCO2_PAGE_LEN         (3 * sizeof(float) + 1)
+
+static uint32_t handleMemGetSize(const uint8_t internal_id) { return MEM_LOCO_ANCHOR_BASE + MEM_LOCO_ANCHOR_PAGE_SIZE * 256; }
+static bool handleMemRead(const uint8_t internal_id, const uint32_t memAddr, const uint8_t readLen, uint8_t* dest);
+static const MemoryHandlerDef_t memDef = {
+  .type = MEM_TYPE_LOCO2,
+  .getSize = handleMemGetSize,
+  .read = handleMemRead,
+  .write = 0, // Write is not supported
+};
+static void buildAnchorMemList(const uint32_t memAddr, const uint8_t readLen, uint8_t* dest, const uint32_t pageBase_address, const uint8_t anchorCount, const uint8_t unsortedAnchorList[]);
 
 static void txCallback(dwDevice_t *dev)
 {
@@ -140,16 +189,80 @@ static void txCallback(dwDevice_t *dev)
 
 static void rxCallback(dwDevice_t *dev)
 {
+  dbgRxCount++;
   timeout = algorithm->onEvent(dev, eventPacketReceived);
 }
 
 static void rxTimeoutCallback(dwDevice_t * dev) {
+  dbgTimeoutCount++;
   timeout = algorithm->onEvent(dev, eventReceiveTimeout);
+}
+
+static void rxFailedCallback(dwDevice_t * dev) {
+  dbgFailedCount++;
+  timeout = algorithm->onEvent(dev, eventReceiveFailed);
+}
+
+static bool handleMemRead(const uint8_t internal_id, const uint32_t memAddr, const uint8_t readLen, uint8_t* dest) {
+  bool result = false;
+
+  static uint8_t unsortedAnchorList[MEM_ANCHOR_ID_LIST_LENGTH];
+
+  if (memAddr >= MEM_LOCO2_ID_LIST && memAddr < MEM_LOCO2_ACTIVE_LIST) {
+    uint8_t anchorCount = locoDeckGetAnchorIdList(unsortedAnchorList, MEM_ANCHOR_ID_LIST_LENGTH);
+    buildAnchorMemList(memAddr, readLen, dest, MEM_LOCO2_ID_LIST, anchorCount, unsortedAnchorList);
+    result = true;
+  } else if (memAddr >= MEM_LOCO2_ACTIVE_LIST && memAddr < MEM_LOCO2_ANCHOR_BASE) {
+    uint8_t anchorCount = locoDeckGetActiveAnchorIdList(unsortedAnchorList, MEM_ANCHOR_ID_LIST_LENGTH);
+    buildAnchorMemList(memAddr, readLen, dest, MEM_LOCO2_ACTIVE_LIST, anchorCount, unsortedAnchorList);
+    result = true;
+  } else {
+    if (memAddr >= MEM_LOCO2_ANCHOR_BASE) {
+      uint32_t pageAddress = memAddr - MEM_LOCO2_ANCHOR_BASE;
+      if ((pageAddress % MEM_LOCO2_ANCHOR_PAGE_SIZE) == 0 && MEM_LOCO2_PAGE_LEN == readLen) {
+        uint32_t anchorId = pageAddress / MEM_LOCO2_ANCHOR_PAGE_SIZE;
+
+        point_t position;
+        memset(&position, 0, sizeof(position));
+        locoDeckGetAnchorPosition(anchorId, &position);
+
+        float* destAsFloat = (float*)dest;
+        destAsFloat[0] = position.x;
+        destAsFloat[1] = position.y;
+        destAsFloat[2] = position.z;
+
+        bool hasBeenSet = (position.timestamp != 0);
+        dest[sizeof(float) * 3] = hasBeenSet;
+
+        result = true;
+      }
+    }
+  }
+
+  return result;
+}
+
+static void buildAnchorMemList(const uint32_t memAddr, const uint8_t readLen, uint8_t* dest, const uint32_t pageBase_address, const uint8_t anchorCount, const uint8_t unsortedAnchorList[]) {
+  for (int i = 0; i < readLen; i++) {
+    int address = memAddr + i;
+    int addressInPage = address - pageBase_address;
+    uint8_t val = 0;
+
+    if (addressInPage == 0) {
+      val = anchorCount;
+    } else {
+      int anchorIndex = addressInPage - 1;
+      if (anchorIndex < anchorCount) {
+        val = unsortedAnchorList[anchorIndex];
+      }
+    }
+
+    dest[i] = val;
+  }
 }
 
 // This function is called from the memory sub system that runs in a different
 // task, protect it from concurrent calls from this task
-// TODO krri Break the dependency, do not call directly from other modules into the deck driver
 bool locoDeckGetAnchorPosition(const uint8_t anchorId, point_t* position)
 {
   if (!isInit) {
@@ -164,7 +277,6 @@ bool locoDeckGetAnchorPosition(const uint8_t anchorId, point_t* position)
 
 // This function is called from the memory sub system that runs in a different
 // task, protect it from concurrent calls from this task
-// TODO krri Break the dependency, do not call directly from other modules into the deck driver
 uint8_t locoDeckGetAnchorIdList(uint8_t unorderedAnchorList[], const int maxListSize) {
   if (!isInit) {
     return 0;
@@ -178,7 +290,6 @@ uint8_t locoDeckGetAnchorIdList(uint8_t unorderedAnchorList[], const int maxList
 
 // This function is called from the memory sub system that runs in a different
 // task, protect it from concurrent calls from this task
-// TODO krri Break the dependency, do not call directly from other modules into the deck driver
 uint8_t locoDeckGetActiveAnchorIdList(uint8_t unorderedAnchorList[], const int maxListSize) {
   if (!isInit) {
     return 0;
@@ -194,11 +305,25 @@ static bool switchToMode(const lpsMode_t newMode) {
   bool result = false;
 
   if (lpsMode_auto != newMode && newMode <= LPS_NUMBER_OF_ALGORITHMS) {
+    // Print stats for the mode we are leaving before resetting counters
+    DEBUG_PRINT("DWM: leaving %s -> going to %s (rx=%lu timeout=%lu failed=%lu)\n",
+                algorithmsList[algoOptions.currentRangingMode].name,
+                algorithmsList[newMode].name,
+                (unsigned long)dbgRxCount,
+                (unsigned long)dbgTimeoutCount,
+                (unsigned long)dbgFailedCount);
+    dbgRxCount = 0;
+    dbgTimeoutCount = 0;
+    dbgFailedCount = 0;
+
     algoOptions.currentRangingMode = newMode;
     algorithm = algorithmsList[algoOptions.currentRangingMode].algorithm;
 
     algorithm->init(dwm);
     timeout = algorithm->onEvent(dwm, eventTimeout);
+    DEBUG_PRINT("DWM: mode %s init done, first timeout=%lu ms\n",
+                algorithmsList[algoOptions.currentRangingMode].name,
+                (unsigned long)timeout);
 
     result = true;
   }
@@ -233,8 +358,17 @@ static void processAutoModeSwitching() {
         if (algorithm->isRangingOk()) {
           // We have found an algorithm, stop searching and lock to it.
           algoOptions.modeAutoSearchActive = false;
-          DEBUG_PRINT("Automatic mode: detected %s\n", algorithmsList[algoOptions.currentRangingMode].name);
+          DEBUG_PRINT("Automatic mode: detected %s (rx=%lu timeout=%lu failed=%lu)\n",
+                      algorithmsList[algoOptions.currentRangingMode].name,
+                      (unsigned long)dbgRxCount,
+                      (unsigned long)dbgTimeoutCount,
+                      (unsigned long)dbgFailedCount);
         } else {
+          DEBUG_PRINT("DWM: %s ranging NOT ok (rx=%lu timeout=%lu failed=%lu), trying next\n",
+                      algorithmsList[algoOptions.currentRangingMode].name,
+                      (unsigned long)dbgRxCount,
+                      (unsigned long)dbgTimeoutCount,
+                      (unsigned long)dbgFailedCount);
           lpsMode_t newMode = autoModeSearchGetNextMode();
           autoModeSearchTryMode(newMode, now);
         }
@@ -273,16 +407,35 @@ static void uwbTask(void* parameters) {
     handleModeSwitch();
     xSemaphoreGive(algoSemaphore);
 
-    if (xSemaphoreTake(irqSemaphore, timeout / portTICK_PERIOD_MS)) {
+    // Bound the wait so the health probe runs even when the algorithm requests a
+    // very long (TDoA2 uses portMAX_DELAY) timeout
+    uint32_t waitTicks = timeout / portTICK_PERIOD_MS;
+    const uint32_t probeTicks = M2T(locoHealthProbeMs);
+    if (waitTicks > probeTicks) {
+      waitTicks = probeTicks;
+    }
+
+    if (ulTaskNotifyTake(pdTRUE, waitTicks) > 0) {
+      lastUwbActivityTick = xTaskGetTickCount();
+      chipResponding = true;
       do{
         xSemaphoreTake(algoSemaphore, portMAX_DELAY);
         dwHandleInterrupt(dwm);
         xSemaphoreGive(algoSemaphore);
       } while(digitalRead(GPIO_PIN_IRQ) != 0);
     } else {
+      bool probeFailed = false;
       xSemaphoreTake(algoSemaphore, portMAX_DELAY);
       timeout = algorithm->onEvent(dwm, eventTimeout);
+      if ((xTaskGetTickCount() - lastUwbActivityTick) > M2T(locoHealthProbeMs)) {
+        const bool wasResponding = chipResponding;
+        chipResponding = (dwSpiRead32(dwm, CHAN_CTRL, NO_SUB) == expectedChanCtrl);
+        probeFailed = wasResponding && !chipResponding;
+      }
       xSemaphoreGive(algoSemaphore);
+      if (probeFailed) {
+        DEBUG_PRINT("Watchdog: DW1000 lost its configuration (CHAN_CTRL mismatch)\n");
+      }
     }
   }
 }
@@ -324,6 +477,7 @@ static void spiWrite(dwDevice_t* dev, const void *header, size_t headerLength,
   spiExchange(headerLength+dataLength, spiTxBuffer, spiRxBuffer);
   digitalWrite(CS_PIN, HIGH);
   spiEndTransaction();
+  STATS_CNT_RATE_EVENT(&spiWriteCount);
 }
 
 static void spiRead(dwDevice_t* dev, const void *header, size_t headerLength,
@@ -337,25 +491,24 @@ static void spiRead(dwDevice_t* dev, const void *header, size_t headerLength,
   memcpy(data, spiRxBuffer+headerLength, dataLength);
   digitalWrite(CS_PIN, HIGH);
   spiEndTransaction();
+  STATS_CNT_RATE_EVENT(&spiReadCount);
 }
 
-#if LOCODECK_USE_ALT_PINS
-	void __attribute__((used)) EXTI5_Callback(void)
+#if CONFIG_DECK_LOCODECK_USE_ALT_PINS
+  void __attribute__((used)) EXTI5_Callback(void)
 #else
-	void __attribute__((used)) EXTI11_Callback(void)
+  void __attribute__((used)) EXTI11_Callback(void)
 #endif
-	{
-	  portBASE_TYPE  xHigherPriorityTaskWoken = pdFALSE;
+  {
+    portBASE_TYPE  xHigherPriorityTaskWoken = pdFALSE;
 
-	  NVIC_ClearPendingIRQ(EXTI_IRQChannel);
-	  EXTI_ClearITPendingBit(EXTI_LineN);
+    // Unlock interrupt handling task
+    vTaskNotifyGiveFromISR(uwbTaskHandle, &xHigherPriorityTaskWoken);
 
-	  //To unlock RadioTask
-	  xSemaphoreGiveFromISR(irqSemaphore, &xHigherPriorityTaskWoken);
-
-	  if(xHigherPriorityTaskWoken)
-		portYIELD();
-	}
+    if(xHigherPriorityTaskWoken) {
+      portYIELD();
+    }
+  }
 
 static void spiSetSpeed(dwDevice_t* dev, dwSpiSpeed_t speed)
 {
@@ -365,7 +518,11 @@ static void spiSetSpeed(dwDevice_t* dev, dwSpiSpeed_t speed)
   }
   else if (speed == dwSpiSpeedHigh)
   {
+#if defined(CONFIG_DECK_LOCO_SPI_SPEED_12MHZ)
+    spiSpeed = SPI_BAUDRATE_12MHZ;
+#else
     spiSpeed = SPI_BAUDRATE_21MHZ;
+#endif
   }
 }
 
@@ -381,46 +538,32 @@ static dwOps_t dwOps = {
   .delayms = delayms,
 };
 
+static uint8_t locoDeckStatus() {
+  // If init failed we can't trust the chip state to probe it
+  if (!isInit) {
+    return 1;
+  }
+
+  return chipResponding ? 0 : 1;
+}
+
 /*********** Deck driver initialization ***************/
 
 static void dwm1000Init(DeckInfo *info)
 {
   EXTI_InitTypeDef EXTI_InitStructure;
-  GPIO_InitTypeDef GPIO_InitStructure;
-  NVIC_InitTypeDef NVIC_InitStructure;
 
   spiBegin();
 
-  // Init IRQ input
-  bzero(&GPIO_InitStructure, sizeof(GPIO_InitStructure));
-  GPIO_InitStructure.GPIO_Pin = GPIO_PIN_IRQ;
-  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN;
-  //GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_DOWN;
-  GPIO_Init(GPIO_PORT, &GPIO_InitStructure);
-
-  SYSCFG_EXTILineConfig(EXTI_PortSource, EXTI_PinSource);
-
-  EXTI_InitStructure.EXTI_Line = EXTI_LineN;
-  EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
-  EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Rising;
-  EXTI_InitStructure.EXTI_LineCmd = ENABLE;
-  EXTI_Init(&EXTI_InitStructure);
-
-  // Init reset output
-  GPIO_InitStructure.GPIO_Pin = GPIO_PIN_RESET;
-  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_OUT;
-  GPIO_InitStructure.GPIO_OType = GPIO_OType_OD;
-  GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_NOPULL;
-  GPIO_Init(GPIO_PORT, &GPIO_InitStructure);
-
-  // Init CS pin
+  // Init pins
   pinMode(CS_PIN, OUTPUT);
+  pinMode(GPIO_PIN_IRQ, INPUT);
 
-  // Reset the DW1000 chip
-  GPIO_WriteBit(GPIO_PORT, GPIO_PIN_RESET, 0);
-  vTaskDelay(M2T(10));
-  GPIO_WriteBit(GPIO_PORT, GPIO_PIN_RESET, 1);
-  vTaskDelay(M2T(10));
+  // Reset the DW1000 chip. Pull-low. Not allowed to drive high.
+  pinMode(GPIO_PIN_RESET, OUTPUT);
+  digitalWrite(GPIO_PIN_RESET, 0);
+  vTaskDelay(M2T(1));
+  pinMode(GPIO_PIN_RESET, INPUT);
 
   // Initialize the driver
   dwInit(dwm, &dwOps);       // Init libdw
@@ -440,37 +583,57 @@ static void dwm1000Init(DeckInfo *info)
   dwAttachSentHandler(dwm, txCallback);
   dwAttachReceivedHandler(dwm, rxCallback);
   dwAttachReceiveTimeoutHandler(dwm, rxTimeoutCallback);
+  dwAttachReceiveFailedHandler(dwm, rxFailedCallback);
 
   dwNewConfiguration(dwm);
   dwSetDefaults(dwm);
 
 
-  #ifdef LPS_LONGER_RANGE
+  #ifdef CONFIG_DECK_LOCO_LONGER_RANGE
   dwEnableMode(dwm, MODE_SHORTDATA_MID_ACCURACY);
   #else
   dwEnableMode(dwm, MODE_SHORTDATA_FAST_ACCURACY);
   #endif
 
   dwSetChannel(dwm, CHANNEL_2);
-  dwUseSmartPower(dwm, true);
   dwSetPreambleCode(dwm, PREAMBLE_CODE_64MHZ_9);
+
+  #ifdef CONFIG_DECK_LOCO_FULL_TX_POWER
+  dwUseSmartPower(dwm, false);
+  dwSetTxPower(dwm, 0x1F1F1F1Ful);
+  #else
+  dwUseSmartPower(dwm, true);
+  #endif
 
   dwSetReceiveWaitTimeout(dwm, DEFAULT_RX_TIMEOUT);
 
   dwCommitConfiguration(dwm);
 
-  // Enable interrupt
-  NVIC_InitStructure.NVIC_IRQChannel = EXTI_IRQChannel;
-  NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = NVIC_VERY_HIGH_PRI;
-  NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
-  NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
-  NVIC_Init(&NVIC_InitStructure);
+  // Verify the DW1000 is still responding over SPI after configuration.
+  // 0xFFFFFFFF means the chip's SPI interface is unresponsive (MISO floating).
+  if (dwSpiRead32(dwm, SYS_MASK, NO_SUB) == 0xFFFFFFFFul) {
+    DEBUG_PRINT("DWM: ERROR - DW1000 not responding after configure (SPI issue). Deck will not work.\n");
+    isInit = false;
+    return;
+  }
+  expectedChanCtrl = dwSpiRead32(dwm, CHAN_CTRL, NO_SUB);
+  chipResponding = true;
 
-  vSemaphoreCreateBinary(irqSemaphore);
-  vSemaphoreCreateBinary(algoSemaphore);
+  memoryRegisterHandler(&memDef);
 
-  xTaskCreate(uwbTask, "lps", 3*configMINIMAL_STACK_SIZE, NULL,
-                    5/*priority*/, NULL);
+  algoSemaphore= xSemaphoreCreateMutex();
+
+  xTaskCreate(uwbTask, LPS_DECK_TASK_NAME, LPS_DECK_STACKSIZE, NULL,
+                    LPS_DECK_TASK_PRI, &uwbTaskHandle);
+
+  // Set up interrupt
+  SYSCFG_EXTILineConfig(EXTI_PortSource, EXTI_PinSource);
+
+  EXTI_InitStructure.EXTI_Line = EXTI_LineN;
+  EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
+  EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Rising;
+  EXTI_InitStructure.EXTI_LineCmd = ENABLE;
+  EXTI_Init(&EXTI_InitStructure);
 
   isInit = true;
 }
@@ -496,34 +659,156 @@ static bool dwm1000Test()
 static const DeckDriver dwm1000_deck = {
   .vid = 0xBC,
   .pid = 0x06,
-  .name = "bcDWM1000",
+  .name = "bcLoco",
 
-  .usedGpio = 0,  // FIXME: set the used pins
-  .requiredEstimator = kalmanEstimator,
+#ifdef CONFIG_DECK_LOCODECK_USE_ALT_PINS
+  #ifndef CONFIG_LOCODECK_ALT_PIN_RESET
+  .usedGpio = DECK_USING_IO_1 | DECK_USING_IO_2 | DECK_USING_IO_3,
+  #else
+  .usedGpio = DECK_USING_IO_1 | DECK_USING_IO_2 | DECK_USING_IO_4,
+  #endif
+#else
+   // (PC10/PC11 is UART1 TX/RX)
+  .usedGpio = DECK_USING_IO_1 | DECK_USING_PC10 | DECK_USING_PC11,
+#endif
+  .usedPeriph = DECK_USING_SPI,
+  .requiredEstimator = StateEstimatorTypeKalman,
   #ifdef LOCODECK_NO_LOW_INTERFERENCE
   .requiredLowInterferenceRadioMode = false,
   #else
   .requiredLowInterferenceRadioMode = true,
   #endif
 
+
   .init = dwm1000Init,
   .test = dwm1000Test,
+  .status = locoDeckStatus,
 };
 
 DECK_DRIVER(dwm1000_deck);
 
 PARAM_GROUP_START(deck)
-PARAM_ADD(PARAM_UINT8 | PARAM_RONLY, bcDWM1000, &isInit)
+
+/**
+ * @brief Deprecated (removed after August 2023). Use the "deck.bcLoco" parameter instead.
+ *
+ * Nonzero if [Loco positioning deck](%https://store.bitcraze.io/products/loco-positioning-deck) is attached
+ */
+PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, bcDWM1000, &isInit)
+
+/**
+ * @brief Nonzero if [Loco positioning deck](%https://store.bitcraze.io/products/loco-positioning-deck) is attached
+ */
+PARAM_ADD_CORE(PARAM_UINT8 | PARAM_RONLY, bcLoco, &isInit)
+
 PARAM_GROUP_STOP(deck)
+
+
+static uint8_t locoStatusLogger(uint32_t timestamp, void* data) {
+  return locoDeckStatus();
+}
+static logByFunction_t locoStatusLoggerDef = {.acquireUInt8 = locoStatusLogger, .data = 0};
+
+LOG_GROUP_START(deckStatus)
+
+/**
+ * @brief Loco deck status: 0 = ok, non-zero = error
+ */
+LOG_ADD_BY_FUNCTION(LOG_UINT8, bcLoco, &locoStatusLoggerDef)
+
+LOG_GROUP_STOP(deckStatus)
 
 LOG_GROUP_START(ranging)
 LOG_ADD(LOG_UINT16, state, &algoOptions.rangingState)
 LOG_GROUP_STOP(ranging)
 
+/**
+ * Log group for basic information about the Loco Positioning System
+ */
 LOG_GROUP_START(loco)
-LOG_ADD(LOG_UINT8, mode, &algoOptions.currentRangingMode)
+
+/**
+ * @brief The current mode of the Loco Positioning system
+ *
+ * | Value | Mode   | \n
+ * | -     | -      | \n
+ * |   1   | TWR    | \n
+ * |   2   | TDoA 2 | \n
+ * |   3   | TDoA 3 | \n
+ */
+LOG_ADD_CORE(LOG_UINT8, mode, &algoOptions.currentRangingMode)
+
+STATS_CNT_RATE_LOG_ADD(spiWr, &spiWriteCount)
+STATS_CNT_RATE_LOG_ADD(spiRe, &spiReadCount)
 LOG_GROUP_STOP(loco)
 
+/**
+ * The Loco Positioning System implements three different positioning modes:
+ * Two Way Ranging (TWR), Time Difference of Arrival 2 (TDoA 2) and Time Difference of Arrival 3 (TDoA 3)
+ *
+ * ### TWR mode
+ *
+ * In this mode, the tag pings the anchors in sequence, this allows it to
+ * measure the distance between the tag and the anchors. Using this information
+ * a theoretical minimum of 4 Anchors is required to calculate the 3D position
+ * of a Tag, but a more realistic number is 6 to add redundancy and accuracy.
+ * This mode is the most accurate mode and also works when the tag or quad
+ * leaves the space delimited by the anchors. The tag is actively communicating
+ * with the anchors in a time slotted fashion and in this mode only one tag or
+ * quad can be positioned with a maximum of 8 anchors.
+ *
+ * ### TDoA 2 mode
+ *
+ * In TDoA 2 mode, the anchor system is continuously sending synchronization
+ * packets. A tag listening to these packets can calculate the relative
+ * distance to two anchors by measuring the time difference of arrival of the
+ * packets. From the TDoA information it is possible to calculate the 3D
+ * position in space. In this mode the tag is only passively listening, so new
+ * tags do not add any load to the system which makes it possible to position
+ * any number of tags or quads simultaneously. This makes it a perfect
+ * mode for swarming.
+ *
+ * Compared to TWR, TDoA 2 is more restrictive when it comes to the space where
+ * positioning works, ideally the tag should be within, or very close to,
+ * the space delimited by the anchor system. This means that TDoA 2 works best
+ * with 8 anchors placed in the corners of the flying space. In this space the
+ * accuracy and precision is comparable to TWR.
+
+ * In this mode the anchor system is time slotted and synchronized and the
+ * number of anchors is limited to 8.
+ *
+ * ### TDoA 3 mode
+ *
+ * The TDoA 3 mode has many similarities with TDoA 2 and supports any number
+ * of tags or quads. The main difference is that the time slotted scheme of
+ * TDoA 2 has been replaced by a randomized transmission schedule which makes
+ * it possible to add more anchors. By adding more anchors the system can be
+ * scaled to larger spaces or span multiple rooms without line of sight between
+ * all anchors. It also makes it more robust and can handle loss or addition of
+ * anchors dynamically. The estimated position in this mode might be slightly
+ * more noisy compared to TDoA 2.
+ */
 PARAM_GROUP_START(loco)
-PARAM_ADD(PARAM_UINT8, mode, &algoOptions.userRequestedMode)
+
+/**
+ * @brief The Loco positioning mode to use (default: 0)
+ *
+ * | Value | Mode   |\n
+ * | -     | -      |\n
+ * |   0   | Auto   |\n
+ * |   1   | TWR    |\n
+ * |   2   | TDoA 2 |\n
+ * |   3   | TDoA 3 |\n
+ */
+PARAM_ADD_CORE(PARAM_UINT8, mode, &algoOptions.userRequestedMode)
+
+/**
+ * @brief Feed loco measurements into the state estimator (default: 1)
+ *
+ * Set to 0 to stop pushing loco (TWR/TDoA distance, TDoA and absolute height)
+ * measurements into the Kalman filter, while keeping the loco system otherwise
+ * running.
+ */
+PARAM_ADD_CORE(PARAM_UINT8, fwdToEstimator, &locoEnableEstimator)
+
 PARAM_GROUP_STOP(loco)

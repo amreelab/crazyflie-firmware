@@ -44,6 +44,8 @@
 // Timestamp counter frequency
 #define LOCODECK_TS_FREQ (499.2e6 * 128)
 
+#define LOCODECK_ANTENNA_OFFSET 154.6   // In meters
+#define LOCODECK_ANTENNA_DELAY  ((LOCODECK_ANTENNA_OFFSET * LOCODECK_TS_FREQ) / SPEED_OF_LIGHT) // In radio ticks
 
 typedef enum uwbEvent_e {
   eventTimeout,
@@ -117,6 +119,8 @@ bool lpsGetLppShort(lpsLppShortPacket_t* shortPacket);
 
 uint16_t locoDeckGetRangingState();
 void locoDeckSetRangingState(const uint16_t newState);
+
+extern uint8_t locoEnableEstimator;
 
 // LPP Packet types and format
 #define LPP_HEADER_SHORT_PACKET 0xF0

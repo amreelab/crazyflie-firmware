@@ -34,6 +34,9 @@
 
 #include "estimator.h"
 
+/* Forward declaration to avoid circular dependency */
+typedef struct deckDiscoveryBackend_s DeckDiscoveryBackend_t;
+
 /* Maximum number of decks that can be enumerated */
 #define DECK_MAX_COUNT 4
 
@@ -43,43 +46,37 @@ bool deckTest(void);
 
 /***** Driver TOC definitions ******/
 
-/* Used peripherals */
-#define DECK_USING_UART1   (1<<0)
-#define DECK_USING_UART2   (1<<1)
-#define DECK_USING_SPI     (1<<2)
-#define DECK_USING_TIMER3  (1<<3)
-#define DECK_USING_TIMER5  (1<<4)
-#define DECK_USING_TIMER14 (1<<5)
-
 /* Used GPIO */
 #define DECK_USING_PC11 (1<<0)
-#define DECK_USING_RX1  (1<<0)
 #define DECK_USING_PC10 (1<<1)
-#define DECK_USING_TX1  (1<<1)
 #define DECK_USING_PB7  (1<<2)
-#define DECK_USING_SDA  (1<<2)
 #define DECK_USING_PB6  (1<<3)
-#define DECK_USING_SCL  (1<<3)
-#define DECK_USING_PB8  (1<<4)
 #define DECK_USING_IO_1 (1<<4)
-#define DECK_USING_PB5  (1<<5)
 #define DECK_USING_IO_2 (1<<5)
-#define DECK_USING_PB4  (1<<6)
 #define DECK_USING_IO_3 (1<<6)
-#define DECK_USING_PC12 (1<<7)
 #define DECK_USING_IO_4 (1<<7)
 #define DECK_USING_PA2  (1<<8)
-#define DECK_USING_TX2  (1<<8)
 #define DECK_USING_PA3  (1<<9)
-#define DECK_USING_RX2  (1<<9)
 #define DECK_USING_PA5  (1<<10)
-#define DECK_USING_SCK  (1<<10)
 #define DECK_USING_PA6  (1<<11)
-#define DECK_USING_MISO (1<<11)
 #define DECK_USING_PA7  (1<<12)
-#define DECK_USING_MOSI (1<<12)
+
+
+/* Used peripherals */
+#define DECK_USING_UART1   (DECK_USING_PC10 | DECK_USING_PC11)
+#define DECK_USING_UART2   (DECK_USING_PA2  | DECK_USING_PA3)
+#define DECK_USING_SPI     (DECK_USING_PA5  | DECK_USING_PA6 | DECK_USING_PA7)
+#define DECK_USING_I2C     (DECK_USING_PB6  | DECK_USING_PB7)
+#define DECK_USING_TIMER3  (1 << 13)
+#define DECK_USING_TIMER5  (1 << 14)
+#define DECK_USING_TIMER10 (1 << 16)
+#define DECK_USING_TIMER14 (1 << 15)
+#define DECK_USING_TIMER9  (1 << 17)
+#define DECK_USING_TIMER4  (1 << 18)
 
 struct deckInfo_s;
+struct deckFwUpdate_s;
+typedef struct deckMemDef_s deckMemDef_t;
 
 /* Structure definition and registering macro */
 typedef struct deck_driver {
@@ -88,20 +85,59 @@ typedef struct deck_driver {
   uint8_t pid;
   char *name;
 
-  /* Periphreal and Gpio used _dirrectly_ by the driver */
+  /*
+   * Peripheral and Gpio used _directly_ by the driver.
+   *
+   * Include the pin in usedGpio if it's used directly by the driver, do not
+   * add the pin to usedGpio if it used as part of a peripheral.
+   *
+   * For example: If a deck driver uses SPI we add DECK_USING_SPI to
+   * usedPeriph. If the deck uses the MOSI, MISO or SCK pins for other stuff
+   * than SPI it would have to specify DECK_USING_[PA7|PA6|PA5].
+   *
+   */
   uint32_t usedPeriph;
   uint32_t usedGpio;
 
   /* Required system properties */
   StateEstimatorType requiredEstimator;
   bool requiredLowInterferenceRadioMode;
+  bool requiredKalmanEstimatorAttitudeReversionOff;
+
+  // Deck memory access definitions
+  const struct deckMemDef_s* memoryDef;
+
+  // Secondary memory area for instance for decks with two firmwares.
+  const struct deckMemDef_s* memoryDefSecondary;
 
   /* Init and test functions */
   void (*init)(struct deckInfo_s *);
   bool (*test)(void);
+
+  /* Runtime hardware status probe. Return 0 if the deck is healthy, a non-zero
+   * error code otherwise. Set to NULL if the deck has no status probe (it is
+   * then never probed).
+   *
+   * The deck supervisor polls this from the system supervisor's safety path at
+   * the supervisor rate, so it must be cheap and non-blocking (no waits on
+   * mutexes, no slow bus transactions in the call itself - cache results from
+   * the deck task instead).
+   *
+   * IMPORTANT: when CONFIG_DECK_SUPERVISOR is enabled a non-zero return blocks
+   * arming and, while flying, immediately cuts the motors. The result must
+   * therefore be debounced in the driver - a single transient non-zero reading
+   * will trigger the cut, so do not report short, recoverable glitches as an
+   * error. Return non-zero if the deck failed to initialize, since its state
+   * cannot be trusted to be probed. */
+  uint8_t (*status)(void);
 } DeckDriver;
 
+#ifndef UNIT_TEST_MODE
 #define DECK_DRIVER(NAME) const struct deck_driver * driver_##NAME __attribute__((section(".deckDriver." #NAME), used)) = &(NAME)
+#else
+// Unit tests access the registration pointer directly and do not use the firmware linker section.
+#define DECK_DRIVER(NAME) const struct deck_driver * driver_##NAME = &(NAME)
+#endif
 
 /****** Deck_info *******/
 
@@ -135,20 +171,98 @@ typedef struct deckInfo_s {
 
   TlvArea tlv;
   const DeckDriver *driver;
+
+  /* Track which discovery backend found this deck */
+  const DeckDiscoveryBackend_t *discoveryBackend;
+  /* Backend-specific context pointer, this is private for each backend */
+  void* backendContext;
+
+  /* Generic deck information fields, NULL if not set */
+  char * productName;
+  char * boardRevision;
+
+  uint8_t production_year;
+  uint8_t production_month;
+  uint8_t production_day;
+
 } DeckInfo;
+
+/**
+ * @brief Definition of function that is called when a block of a new firmware is uploaded to the deck.
+ * The upload will be done in small but continouse pieces.
+ * @param vAddr: Address where the buffer should be written. The start of the firmware is at address 0.
+ * @param len: Buffer length
+ * @param buffer: Buffer to write in the firmware memory
+ * @param memDef: The memory def for the device the write is related to
+ *
+ * @return True if the buffer could be written successfully, false otherwise (if the deck is not in bootloader
+ *         mode for example)
+ */
+typedef bool (deckMemoryWrite)(const uint32_t vAddr, const uint8_t len, const uint8_t* buffer, const struct deckMemDef_s* memDef);
+
+/**
+ * @brief Definition of function to read the firmware
+ *
+ * @param vAddr: Address where the data should be read. The start of the firmware is at address 0.
+ * @param len: Length to read.
+ * @param buffer: Buffer where to output the data
+ *
+ * @return True if the buffer could be read successully, false otherwise (if the deck if not in bootloader
+ *         mode for example)
+ */
+typedef bool (deckMemoryRead)(const uint32_t vAddr, const uint8_t len, uint8_t* buffer);
+
+#define DECK_MEMORY_MASK_STARTED 1
+#define DECK_MEMORY_MASK_UPGRADE_REQUIRED 2
+#define DECK_MEMORY_MASK_BOOT_LOADER_ACTIVE 4
+#define DECK_MEMORY_MASK_SUPPORTS_HOT_RESTART 8
+
+/**
+ * @brief Definition of function to query a deck for properties related to memory
+ *
+ * @return bitfield using the DECK_MEMORY_MASK_XXX definitions
+ */
+typedef uint8_t (deckMemoryProperties)();
+
+/**
+ * @brief Definition of function to execute a command
+ */
+typedef void (deckMemoryCommandCallback)();
+
+/**
+ * @brief This struct defines the firmware required by the deck and the function
+ * to use to flash new firmware to the deck.
+ */
+typedef struct deckMemDef_s {
+  // Functions that will be called to read or write to the deck memory.
+  deckMemoryWrite* write;
+  deckMemoryRead* read;
+
+  // Function to query properties of the deck memory
+  deckMemoryProperties* properties;
+
+  // Set to true if the deck supports FW upgrades
+  bool supportsUpgrade;
+
+  // A pointer to a uint32_t that holds the size of a new FW to be flashed to the device (if supported)
+  // Updated by the cfloader during flashing and should be considered read-only
+  uint32_t* newFwSizeP;
+
+  // Definition of the required firmware for the deck (if supported)
+  uint32_t requiredHash;
+  uint32_t requiredSize;
+
+  // Optional id, if non-null will be added to the name as [drivername:id]
+  const char *id;
+
+  // Optional command callbacks
+  deckMemoryCommandCallback* commandResetToFw;
+  deckMemoryCommandCallback* commandResetToBootloader;
+} DeckMemDef_t;
 
 int deckCount(void);
 
 DeckInfo * deckInfo(int i);
-
-/* Key/value area handling */
-bool deckTlvHasElement(TlvArea *tlv, int type);
-
-int deckTlvGetString(TlvArea *tlv, int type, char *string, int maxLength);
-
-char* deckTlvGetBuffer(TlvArea *tlv, int type, int *length);
-
-void deckTlvGetTlv(TlvArea *tlv, int type, TlvArea *output);
 
 /* Defined Types */
 #define DECK_INFO_NAME 1
@@ -172,5 +286,9 @@ const struct deck_driver* deckFindDriverByName(char* name);
 StateEstimatorType deckGetRequiredEstimator();
 
 bool deckGetRequiredLowInterferenceRadioMode();
+bool deckGetRequiredKalmanEstimatorAttitudeReversionOff();
+
+// Including deck-discovery.h here to avoid circular dependency
+#include "deck_discovery.h"
 
 #endif //__DECK_CODE_H__

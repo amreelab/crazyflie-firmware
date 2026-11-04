@@ -5,8 +5,6 @@
  * +------+    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
  *  ||  ||    /_____/_/\__/\___/_/   \__,_/ /___/\___/
  *
- * LPS node firmware.
- *
  * Copyright 2019, Bitcraze AB
  *
  * This program is free software: you can redistribute it and/or modify
@@ -26,31 +24,29 @@
 
 #include <stdbool.h>
 
+#include "autoconf.h"
+
 #include "FreeRTOS.h"
 #include "task.h"
 
 #include "system.h"
+#include "static_mem.h"
 
 #include "app.h"
 
-#ifndef APP_STACKSIZE
-#define APP_STACKSIZE 300
-#endif
-
-#ifndef APP_PRIORITY
-#define APP_PRIORITY 0
-#endif
-
 static bool isInit = false;
+
+STATIC_MEM_TASK_ALLOC(appTask, CONFIG_APP_STACKSIZE);
 
 static void appTask(void *param);
 
 void __attribute__((weak)) appInit()
 {
-  if (isInit) return;
+  if (isInit) {
+    return;
+  }
 
-  xTaskCreate(appTask, "app", APP_STACKSIZE, NULL,
-              APP_PRIORITY, NULL);
+  STATIC_MEM_TASK_CREATE(appTask, appTask, APP_TASK_NAME, NULL, CONFIG_APP_PRIORITY);
   isInit = true;
 }
 

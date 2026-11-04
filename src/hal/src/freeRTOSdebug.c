@@ -1,6 +1,6 @@
 /**
- *    ||          ____  _ __                           
- * +------+      / __ )(_) /_______________ _____  ___ 
+ *    ||          ____  _ __
+ * +------+      / __ )(_) /_______________ _____  ___
  * | 0xBC |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
  * +------+    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
  *  ||  ||    /_____/_/\__/\___/_/   \__,_/ /___/\___/
@@ -33,25 +33,37 @@
 #include "debug.h"
 #include "nvicconf.h"
 #include "led.h"
+#include "motors.h"
 
 uint32_t traceTickCount;
 
 void vApplicationMallocFailedHook( void )
 {
-	  portDISABLE_INTERRUPTS();
-	  DEBUG_PRINT("\nMalloc failed!\n");
-	  ledSet(ERR_LED1, 1);
-	  ledSet(ERR_LED2, 1);
-	  while(1);
-}
-
-#if (configCHECK_FOR_STACK_OVERFLOW == 1)
-void vApplicationStackOverflowHook(xTaskHandle *pxTask, signed portCHAR *pcTaskName)
-{
   portDISABLE_INTERRUPTS();
-  DEBUG_PRINT("\nStack overflow!\n");
+  DEBUG_PRINT("\nMalloc failed!\n");
   ledSet(ERR_LED1, 1);
   ledSet(ERR_LED2, 1);
+  motorsStop();
+  storeAssertTextData("Malloc failed");
+  while(1);
+}
+
+#if (configCHECK_FOR_STACK_OVERFLOW > 0)
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char * pcTaskName)
+{
+  portDISABLE_INTERRUPTS();
+  DEBUG_PRINT("\nStack overflow in task: %s\n", pcTaskName);
+  ledSet(ERR_LED1, 1);
+  ledSet(ERR_LED2, 1);
+  motorsStop();
+
+  // Store task name directly so we can see which task overflowed
+  if (pcTaskName && pcTaskName[0] != '\0') {
+    storeAssertTextData(pcTaskName);
+  } else {
+    storeAssertTextData("Stack overflow: unknown");
+  }
+
   while(1);
 }
 #endif

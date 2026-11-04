@@ -55,6 +55,9 @@ float polyval(float const p[PP_SIZE], float t);
 // construct a linear polynomial from p(0) = x0 to p(duration) = x1.
 void polylinear(float p[PP_SIZE], float duration, float x0, float x1);
 
+// construct a polynomial from Bezier curve control points
+void polybezier(float p[PP_SIZE], float duration, float* x, int dim);
+
 // plan a degree-5 polynomial with the given duration T,
 // and given initial/final position, velocity, and acceleration
 void poly5(float poly[PP_SIZE], float T,
@@ -82,7 +85,7 @@ struct poly4d
 {
 	float p[4][PP_SIZE];
 	float duration; // TODO use int millis instead?
-} __attribute__((packed));
+};
 
 // construct a 4d zero polynomial.
 struct poly4d poly4d_zero(float duration);
@@ -117,9 +120,13 @@ struct traj_eval
 	struct vec pos;
 	struct vec vel;
 	struct vec acc;
+	struct vec jerk;
 	struct vec omega;
 	float yaw;
 };
+
+// a traj_eval with all zero members.
+struct traj_eval traj_eval_zero(void);
 
 // a special value of traj_eval that indicates an invalid result.
 struct traj_eval traj_eval_invalid(void);
@@ -130,7 +137,8 @@ bool is_traj_eval_valid(struct traj_eval const *ev);
 // evaluate a single polynomial piece
 struct traj_eval poly4d_eval(struct poly4d const *p, float t);
 
-
+// rotate and then translate a traj_eval object
+void traj_eval_transform(struct traj_eval *ev, struct vec shift, float rotation);
 
 // ----------------------------------//
 // piecewise polynomial trajectories //
@@ -141,6 +149,7 @@ struct piecewise_traj
 	float t_begin;
 	float timescale;
 	struct vec shift;
+	float shift_yaw;
 	unsigned char n_pieces;
 	struct poly4d* pieces;
 };

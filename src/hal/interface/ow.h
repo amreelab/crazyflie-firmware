@@ -1,6 +1,6 @@
 /**
- *    ||          ____  _ __                           
- * +------+      / __ )(_) /_______________ _____  ___ 
+ *    ||          ____  _ __
+ * +------+      / __ )(_) /_______________ _____  ___
  * | 0xBC |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
  * +------+    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
  *  ||  ||    /_____/_/\__/\___/_/   \__,_/ /___/\___/
@@ -25,7 +25,7 @@
  */
 #ifndef __OW_H__
 #define __OW_H__
- 
+
 #include <stdint.h>
 #include "syslink.h"
 
@@ -64,12 +64,10 @@ typedef struct owSerialNum_s
 } OwSerialNum;
 
 void owInit();
-bool owTest();
-void owSyslinkRecieve(SyslinkPacket *slp);
+void owSyslinkReceive(SyslinkPacket *slp);
 bool owScan(uint8_t *nMem);
 bool owGetinfo(uint8_t selectMem, OwSerialNum *serialNum);
 bool owRead(uint8_t selectMem, uint16_t address, uint8_t length, uint8_t *data);
-bool owWrite(uint8_t selectMem, uint16_t address, uint8_t length, uint8_t *data);
+bool owWrite(uint8_t selectMem, uint16_t address, uint8_t length, const uint8_t *data);
 
 #endif //__OW_H__
-
